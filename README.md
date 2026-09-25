@@ -72,10 +72,10 @@ pytest --cov=app --cov-report=term-missing   # coverage: app/main.py untested at
 
 ## What I'd do with more time
 
-- Extend-visibility ("heartbeat") and requeue-from-DLQ endpoints
+- Extend visibility timeout on demand and requeue-from-DLQ endpoints
 - Persistence (WAL) + replication for real durability/failover
-- Fix the `visibility_heap`'s unbounded growth between an ack and its now-irrelevant stale deadline entry (indexed heap or tombstone eviction)
 - Delete-queue and update-queue-config endpoints
 - Load test to validate the p95 < 100ms target under real concurrency
+- A background worker thread per queue, running `_reap()` on a timer instead of lazily on every call — would take redelivery/TTL-expiry work off the hot path of enqueue/dequeue/ack, at the cost of the "no background threads" simplicity trade-off described above; only worth it if load testing actually shows per-call reaping as a measurable latency cost
 - Multi-tenancy / auth on the API
 
