@@ -45,17 +45,48 @@ One `threading.Lock` per queue, not a single global lock — operations on diffe
 
 ## Scalability story
 
-Today this is a single process. To scale out: shard queues across N stateless service instances by hashing the queue name (`hash(name) % N`) behind a routing layer, so all operations for a given queue always land on the same instance — each instance keeps owning its own in-memory queues, no cross-instance coordination needed for a single queue's operations. Rebalancing on scale-up/down would need consistent hashing plus a state-transfer step, since state is in-memory.
+**Today:** a single process holds all state, so it can't be scaled out as-is.
 
-**This doesn't help a single hot queue.** Hashing by queue name pins one queue to exactly one instance regardless of `N` — a classic hot-partition problem, the same one any hash-sharded system (Kafka partitions, DynamoDB partition keys) runs into. Adding more instances only spreads *other* queues more thinly; it does nothing for the one queue that's actually overloaded. Fixing that would mean sub-sharding a single logical queue across multiple `MessageQueue` instances (e.g. by priority level or a hash of message ID) — but that's a real trade-off, not a free scale-out: this service's core guarantee is strict priority + FIFO-within-priority ordering enforced by one lock over one set of heaps per queue, so splitting a queue means either accepting weaker per-shard-only ordering or adding cross-shard merge logic on the consumer side. Before reaching for that complexity, it's worth measuring whether a single queue's lock (held only briefly per operation, with no I/O) actually becomes a bottleneck in practice, or whether vertical scaling of that one shard is enough.
+**Production design:** move the queue state into Redis so the API servers become stateless and any instance can serve any request. The same structures map directly:
+
+
+| In-memory (today)                       | Redis                                                                        |
+| --------------------------------------- | ---------------------------------------------------------------------------- |
+| Per-priority ready heap, keyed by `seq` | One sorted set per priority, score = `seq`                                   |
+| Visibility-timeout heap                 | Sorted set, score = deadline                                                 |
+| TTL heap                                | Sorted set, score = expiry time                                              |
+| `_messages` dict                        | One hash per message (payload, delivery count, receipt handle, enqueue time) |
+| Per-queue lock                          | A Lua script per operation (Redis runs each script atomically)               |
+
+
+- **Sequence numbers:** `INCR` on a per-queue counter, done inside the enqueue script. This is strictly increasing, so FIFO within a priority still holds.
+- **Time:** scripts use Redis's own clock (`TIME`), so visibility deadlines are consistent no matter which API server handled the call.
+- **Reaping** (returning timed-out messages to ready, moving exhausted ones to the DLQ, dropping expired ones) happens in two places. A small background sweeper runs every second or so and keeps idle queues and metrics accurate. The dequeue script also does a small reap itself, so redelivery is still prompt if the sweeper is late. Both are atomic scripts with a cap on entries handled per call, so running them twice is harmless and neither blocks Redis for long.
+- **Scaling Redis:** with Redis Cluster, all keys for a queue share a hash tag (`q:{name}:...`) so its scripts run on one shard.
+
+**Limits:** this doesn't help a single very hot queue. Enqueue, dequeue and ack are all writes, so they must go to the one primary that owns the queue; read replicas only help with metrics and DLQ reads. To push one queue further, batch operations, use a bigger instance, or split the queue across shards (which weakens the ordering guarantee). Memory also bounds the backlog, so Redis should run with `noeviction` and the API should cap payload size and queue depth.
 
 ## Durability story
 
-Currently: at-least-once delivery holds only while the process is alive — a crash loses all in-memory state (ready, in-flight, and DLQ messages). A production version would add a write-ahead log (append-only, fsync'd on enqueue/ack) so state can be replayed on restart, plus replication to a standby so a single node's disk isn't a single point of failure.
+**Today:** at-least-once delivery holds only while the process is alive. A crash loses everything (ready, in-flight and DLQ).
+
+**Production design:** Redis with AOF persistence (Redis writes every change to a log file on disk) and at least one replica.
+
+- **What survives:** if Redis restarts, it reloads its data from the AOF file, so messages are not lost. If the Redis machine itself dies, a replica takes over.
+- **What can still be lost:** replication is asynchronous, so the last moments of writes may not have reached the replica yet. A message enqueued just before a crash could be lost.
+- **Closing that gap:** the API can wait for a replica to confirm each write (`WAIT`) before telling the producer it succeeded. This is safer but adds some latency.
+- **No separate log in S3 or a database:** AOF and replication already do this job, and writing to a second system would add latency and two copies that can disagree. Periodic backups to S3 are still a good idea for disaster recovery.
+- **Duplicates:** the queue guarantees at-least-once delivery, so a message can occasionally arrive twice. Consumers should handle that (for example by ignoring a message ID they've already processed).
+
+**Alternative:** if "an acknowledged message is never lost" must be a hard guarantee and throughput is moderate, a Postgres-backed queue is a better fit. Dequeue uses `SELECT ... FOR UPDATE SKIP LOCKED`, the visibility timeout is a `visible_at` column, and commits are durable with a synchronous replica. The trade-offs are lower peak throughput and needing to keep table bloat under control.
 
 ## Node failure handling
 
-Today: if the instance owning a queue goes down, that queue's messages are gone until restart (no failover). Production: replicate each queue's WAL to a standby that can take over as leader; consumers already tolerate a node going away mid-processing via the visibility-timeout mechanism, so failover mainly needs the *ready/in-flight state* to be recoverable, not the delivery protocol to change.
+- **API server dies:** nothing is lost, because servers hold no state. The load balancer routes to another instance. Messages that were in flight there are redelivered after their visibility timeout.
+- **Redis primary dies:** a replica is promoted (Sentinel or Cluster failover). Writes that hadn't replicated yet may be lost, and acks that hadn't replicated may cause a message to be delivered again. Duplicates are allowed under at-least-once, so the delivery protocol doesn't change.
+- **Consumer dies mid-processing:** the visibility timeout expires and the message is redelivered, as today.
+
+
 
 ## Testing approach
 
@@ -73,7 +104,7 @@ pytest --cov=app --cov-report=term-missing   # coverage: app/main.py untested at
 ## What I'd do with more time
 
 - Extend visibility timeout on demand and requeue-from-DLQ endpoints
-- Persistence (WAL) + replication for real durability/failover
+- Redis-backed storage (see "Scalability story") for durability, failover and stateless API servers
 - Delete-queue and update-queue-config endpoints
 - Load test to validate the p95 < 100ms target under real concurrency
 - A background worker thread per queue, running `_reap()` on a timer instead of lazily on every call — would take redelivery/TTL-expiry work off the hot path of enqueue/dequeue/ack, at the cost of the "no background threads" simplicity trade-off described above; only worth it if load testing actually shows per-call reaping as a measurable latency cost
